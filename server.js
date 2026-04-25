@@ -5,7 +5,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 5000;
+const PORT = Number(process.env.PORT) || 5000;
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
