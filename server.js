@@ -8,7 +8,7 @@ app.use(express.json());
 // in-memory data
 let courses = [
   {
-    code: "WEB-210",
+    code: "WEB-220",
     title: "Web Development I",
     instructor: "Prof. Patel",
     schedule: "TR 13:00-14:15",
