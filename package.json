@@ -1,11 +1,11 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "main": "copy_backend_script.js",
+  "main": "script.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node copy_backend_script.js",
-    "server": "node copy_backend_script.js"
+    "start": "node script.js",
+    "server": "node script.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
