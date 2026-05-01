@@ -1,14 +1,40 @@
 const express = require("express");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const {
+  initializeDatabase,
+  getUserById,
+  getUserByUsername,
+  getAllCourses,
+  getCourseByCode,
+  createCourse,
+  updateCourse,
+  enrollStudent,
+  dropStudent,
+  deleteCourse
+} = require("./db");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT) || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "development-only-secret-change-me";
+const TOKEN_EXPIRATION = "8h";
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeLowerText(value) {
+  return normalizeText(value).toLowerCase();
 }
 
 function normalizeNumber(value) {
@@ -25,7 +51,7 @@ function buildCoursePayload(payload, existingCourse = {}) {
     description: normalizeText(payload.description ?? existingCourse.description),
     credits: normalizeNumber(payload.credits ?? existingCourse.credits),
     capacity: normalizeNumber(payload.capacity ?? existingCourse.capacity),
-    students: Array.isArray(existingCourse.students) ? existingCourse.students : []
+    students: Array.isArray(existingCourse.students) ? [...existingCourse.students] : []
   };
 
   return course;
@@ -59,42 +85,130 @@ function validateCourse(course, { requireCode = true } = {}) {
   return null;
 }
 
-// in-memory data
-let courses = [
-  {
-    code: "WEB-220",
-    title: "Web Development I",
-    instructor: "Prof. Patel",
-    schedule: "TR 13:00-14:15",
-    credits: 3,
-    capacity: 24,
-    description: "Introductory web development course covering HTML, CSS, and JavaScript.",
-    students: []
-  },
-  {
-    code: "DBA-220",
-    title: "Database Fundamentals",
-    instructor: "Prof. Rivera",
-    schedule: "TR 09:30-11:20",
-    credits: 3,
-    capacity: 24,
-    description: "Relational database concepts, modeling, and introductory SQL.",
-    students: []
-  }
-];
+function buildUserResponse(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    name: user.name,
+    enrolledCourses: user.role === "student" ? [...user.enrolledCourses] : undefined
+  };
+}
 
-// test route
+function buildCourseResponse(course, user) {
+  const baseCourse = {
+    code: course.code,
+    title: course.title,
+    instructor: course.instructor,
+    schedule: course.schedule,
+    description: course.description,
+    credits: course.credits,
+    capacity: course.capacity,
+    enrolledCount: course.students.length,
+    availableSeats: Math.max(course.capacity - course.students.length, 0)
+  };
+
+  if (user.role === "teacher") {
+    return {
+      ...baseCourse,
+      students: [...course.students]
+    };
+  }
+
+  return {
+    ...baseCourse,
+    enrolled: course.students.includes(user.id)
+  };
+}
+
+const authenticateToken = asyncHandler(async (req, res, next) => {
+  const authorizationHeader = req.headers.authorization || "";
+  const [scheme, token] = authorizationHeader.split(" ");
+
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ message: "A valid bearer token is required" });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = await getUserById(payload.sub);
+
+    if (!user) {
+      return res.status(401).json({ message: "User account no longer exists" });
+    }
+
+    req.user = user;
+    return next();
+  } catch (error) {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+});
+
+function authorizeRoles(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ message: "You do not have permission to perform this action" });
+    }
+
+    next();
+  };
+}
+
+// public routes
 app.get("/", (req, res) => {
   res.send("Backend is working");
 });
 
-// get all courses
-app.get("/courses", (req, res) => {
-  res.json(courses);
+app.post("/auth/login", asyncHandler(async (req, res) => {
+  const username = normalizeLowerText(req.body.username);
+  const password = normalizeText(req.body.password);
+
+  if (!username || !password) {
+    return res.status(400).json({ message: "Username and password are required" });
+  }
+
+  const user = await getUserByUsername(username);
+
+  if (!user) {
+    return res.status(401).json({ message: "Invalid username or password" });
+  }
+
+  const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+
+  if (!isPasswordValid) {
+    return res.status(401).json({ message: "Invalid username or password" });
+  }
+
+  const token = jwt.sign(
+    {
+      role: user.role,
+      username: user.username
+    },
+    JWT_SECRET,
+    {
+      expiresIn: TOKEN_EXPIRATION,
+      subject: user.id
+    }
+  );
+
+  return res.json({
+    message: "Login successful",
+    token,
+    user: buildUserResponse(user)
+  });
+}));
+
+// authenticated routes
+app.get("/auth/me", authenticateToken, (req, res) => {
+  res.json({ user: buildUserResponse(req.user) });
 });
 
-// add a new course
-app.post("/courses", (req, res) => {
+app.get("/courses", authenticateToken, asyncHandler(async (req, res) => {
+  const courses = await getAllCourses();
+  res.json(courses.map(course => buildCourseResponse(course, req.user)));
+}));
+
+app.post("/courses", authenticateToken, authorizeRoles("teacher"), asyncHandler(async (req, res) => {
   const newCourse = buildCoursePayload(req.body);
   const validationError = validateCourse(newCourse);
 
@@ -102,21 +216,25 @@ app.post("/courses", (req, res) => {
     return res.status(400).json({ message: validationError });
   }
 
-  const duplicateCourse = courses.find(course => course.code === newCourse.code);
+  const duplicateCourse = await getCourseByCode(newCourse.code);
 
   if (duplicateCourse) {
     return res.status(400).json({ message: "Course code already exists" });
   }
 
-  courses.push(newCourse);
+  const createdCourse = await createCourse(newCourse);
+  const courses = await getAllCourses();
 
-  res.status(201).json({ message: "Course added successfully", course: newCourse, courses });
-});
+  return res.status(201).json({
+    message: "Course added successfully",
+    course: buildCourseResponse(createdCourse, req.user),
+    courses: courses.map(course => buildCourseResponse(course, req.user))
+  });
+}));
 
-// update a course
-app.put("/courses/:code", (req, res) => {
+app.put("/courses/:code", authenticateToken, authorizeRoles("teacher"), asyncHandler(async (req, res) => {
   const { code } = req.params;
-  const course = courses.find(c => c.code === code);
+  const course = await getCourseByCode(code);
 
   if (!course) {
     return res.status(404).json({ message: "Course not found" });
@@ -133,32 +251,28 @@ app.put("/courses/:code", (req, res) => {
     return res.status(400).json({ message: "Capacity cannot be less than enrolled students" });
   }
 
-  course.title = updatedCourse.title;
-  course.instructor = updatedCourse.instructor;
-  course.schedule = updatedCourse.schedule;
-  course.credits = updatedCourse.credits;
-  course.capacity = updatedCourse.capacity;
-  course.description = updatedCourse.description;
+  const storedCourse = await updateCourse(code, updatedCourse);
 
-  res.json({ message: "Course updated successfully", course });
-});
+  return res.json({
+    message: "Course updated successfully",
+    course: buildCourseResponse(storedCourse, req.user)
+  });
+}));
 
-// enroll a student in a course
-app.post("/enroll", (req, res) => {
-  const studentId = normalizeText(req.body.studentId);
+app.post("/enroll", authenticateToken, authorizeRoles("student"), asyncHandler(async (req, res) => {
   const courseCode = normalizeText(req.body.courseCode);
 
-  if (!studentId || !courseCode) {
-    return res.status(400).json({ message: "Student ID and course code are required" });
+  if (!courseCode) {
+    return res.status(400).json({ message: "Course code is required" });
   }
 
-  const course = courses.find(c => c.code === courseCode);
+  const course = await getCourseByCode(courseCode);
 
   if (!course) {
     return res.status(404).json({ message: "Course not found" });
   }
 
-  if (course.students.includes(studentId)) {
+  if (course.students.includes(req.user.id)) {
     return res.status(400).json({ message: "Student already enrolled" });
   }
 
@@ -166,51 +280,76 @@ app.post("/enroll", (req, res) => {
     return res.status(400).json({ message: "Course is full" });
   }
 
-  course.students.push(studentId);
+  await enrollStudent(req.user.id, course.code);
+  const updatedCourse = await getCourseByCode(course.code);
+  const updatedUser = await getUserById(req.user.id);
 
-  res.json({ message: "Student enrolled successfully", course });
-});
+  return res.json({
+    message: "Student enrolled successfully",
+    course: buildCourseResponse(updatedCourse, updatedUser),
+    user: buildUserResponse(updatedUser)
+  });
+}));
 
-// drop a student from a course
-app.post("/drop", (req, res) => {
-  const studentId = normalizeText(req.body.studentId);
+app.post("/drop", authenticateToken, authorizeRoles("student"), asyncHandler(async (req, res) => {
   const courseCode = normalizeText(req.body.courseCode);
 
-  if (!studentId || !courseCode) {
-    return res.status(400).json({ message: "Student ID and course code are required" });
+  if (!courseCode) {
+    return res.status(400).json({ message: "Course code is required" });
   }
 
-  const course = courses.find(c => c.code === courseCode);
+  const course = await getCourseByCode(courseCode);
 
   if (!course) {
     return res.status(404).json({ message: "Course not found" });
   }
 
-  if (!course.students.includes(studentId)) {
+  if (!course.students.includes(req.user.id)) {
     return res.status(400).json({ message: "Student is not enrolled in this course" });
   }
 
-  course.students = course.students.filter(id => id !== studentId);
+  await dropStudent(req.user.id, course.code);
+  const updatedCourse = await getCourseByCode(course.code);
+  const updatedUser = await getUserById(req.user.id);
 
-  res.json({ message: "Course dropped successfully", course });
-});
+  return res.json({
+    message: "Course dropped successfully",
+    course: buildCourseResponse(updatedCourse, updatedUser),
+    user: buildUserResponse(updatedUser)
+  });
+}));
 
-// delete a course
-app.delete("/courses/:code", (req, res) => {
+app.delete("/courses/:code", authenticateToken, authorizeRoles("teacher"), asyncHandler(async (req, res) => {
   const { code } = req.params;
-
-  const courseExists = courses.find(c => c.code === code);
+  const courseExists = await getCourseByCode(code);
 
   if (!courseExists) {
     return res.status(404).json({ message: "Course not found" });
   }
 
-  courses = courses.filter(c => c.code !== code);
+  await deleteCourse(code);
+  const courses = await getAllCourses();
 
-  res.json({ message: "Course deleted successfully", courses });
+  return res.json({
+    message: "Course deleted successfully",
+    courses: courses.map(course => buildCourseResponse(course, req.user))
+  });
+}));
+
+app.use((error, req, res, next) => {
+  console.error(error);
+  res.status(500).json({ message: "Internal server error" });
 });
 
-// start server
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+async function startServer() {
+  await initializeDatabase();
+
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer().catch(error => {
+  console.error("Failed to start server", error);
+  process.exit(1);
 });
