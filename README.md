@@ -18,6 +18,12 @@ This backend now supports separate student and teacher logins with role-based ac
 - Starter student, teacher, and course data are seeded only if the tables are empty.
 - Data now survives server restarts.
 
+## Render Deployment
+
+- This project pins Node.js 20 because the `sqlite3` native module is not currently deploying cleanly on Render's default Node.js 24 image.
+- If Render previously built the service with Node.js 24, clear the build cache and redeploy after pulling the latest commit.
+- Render should detect the Node version from `package.json` and `.node-version`.
+
 ## Demo Accounts
 
 - Student: `student1` / `StudentPass123!`
